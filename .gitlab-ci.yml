@@ -1,0 +1,224 @@
+# GitLab CI/CD Pipeline for JAR Deployment
+# This pipeline downloads JAR files from Nexus and deploys them to the application server
+
+variables:
+  # Nexus Configuration
+  NEXUS_URL: "${NEXUS_BASE_URL}"
+  NEXUS_REPOSITORY: "${NEXUS_REPO_NAME}"
+  NEXUS_USERNAME: "${NEXUS_USER}"
+  NEXUS_PASSWORD: "${NEXUS_PASS}"
+  
+  # JAR Configuration - Update these with your actual JAR details
+  JAR1_GROUP_ID: "com.example"
+  JAR1_ARTIFACT_ID: "app-core"
+  JAR1_VERSION: "${JAR1_VERSION:-latest}"
+  JAR1_CLASSIFIER: ""
+  
+  JAR2_GROUP_ID: "com.example"
+  JAR2_ARTIFACT_ID: "app-service"
+  JAR2_VERSION: "${JAR2_VERSION:-latest}"
+  JAR2_CLASSIFIER: ""
+  
+  JAR3_GROUP_ID: "com.example"
+  JAR3_ARTIFACT_ID: "app-web"
+  JAR3_VERSION: "${JAR3_VERSION:-latest}"
+  JAR3_CLASSIFIER: ""
+  
+  # Application Server Configuration
+  APP_SERVER_HOST: "${DEPLOY_HOST}"
+  APP_SERVER_USER: "${DEPLOY_USER}"
+  APP_SERVER_PATH: "${DEPLOY_PATH:-/opt/application/lib}"
+  SSH_PRIVATE_KEY: "${DEPLOY_SSH_KEY}"
+
+stages:
+  - download
+  - deploy
+  - verify
+
+# Stage 1: Download JAR files from Nexus
+download_jars:
+  stage: download
+  image: curlimages/curl:latest
+  before_script:
+    - apk add --no-cache wget
+  script:
+    # Create artifacts directory
+    - mkdir -p artifacts
+    
+    # Download JAR 1
+    - |
+      if [ -n "$JAR1_CLASSIFIER" ]; then
+        CLASSIFIER_SUFFIX="-${JAR1_CLASSIFIER}"
+      else
+        CLASSIFIER_SUFFIX=""
+      fi
+      JAR1_URL="${NEXUS_URL}/repository/${NEXUS_REPOSITORY}/${JAR1_GROUP_ID//\.//}/${JAR1_ARTIFACT_ID}/${JAR1_VERSION}/${JAR1_ARTIFACT_ID}-${JAR1_VERSION}${CLASSIFIER_SUFFIX}.jar"
+      echo "Downloading JAR 1 from: $JAR1_URL"
+      wget --user="$NEXUS_USERNAME" --password="$NEXUS_PASSWORD" -O "artifacts/${JAR1_ARTIFACT_ID}-${JAR1_VERSION}.jar" "$JAR1_URL"
+    
+    # Download JAR 2
+    - |
+      if [ -n "$JAR2_CLASSIFIER" ]; then
+        CLASSIFIER_SUFFIX="-${JAR2_CLASSIFIER}"
+      else
+        CLASSIFIER_SUFFIX=""
+      fi
+      JAR2_URL="${NEXUS_URL}/repository/${NEXUS_REPOSITORY}/${JAR2_GROUP_ID//\.//}/${JAR2_ARTIFACT_ID}/${JAR2_VERSION}/${JAR2_ARTIFACT_ID}-${JAR2_VERSION}${CLASSIFIER_SUFFIX}.jar"
+      echo "Downloading JAR 2 from: $JAR2_URL"
+      wget --user="$NEXUS_USERNAME" --password="$NEXUS_PASSWORD" -O "artifacts/${JAR2_ARTIFACT_ID}-${JAR2_VERSION}.jar" "$JAR2_URL"
+    
+    # Download JAR 3
+    - |
+      if [ -n "$JAR3_CLASSIFIER" ]; then
+        CLASSIFIER_SUFFIX="-${JAR3_CLASSIFIER}"
+      else
+        CLASSIFIER_SUFFIX=""
+      fi
+      JAR3_URL="${NEXUS_URL}/repository/${NEXUS_REPOSITORY}/${JAR3_GROUP_ID//\.//}/${JAR3_ARTIFACT_ID}/${JAR3_VERSION}/${JAR3_ARTIFACT_ID}-${JAR3_VERSION}${CLASSIFIER_SUFFIX}.jar"
+      echo "Downloading JAR 3 from: $JAR3_URL"
+      wget --user="$NEXUS_USERNAME" --password="$NEXUS_PASSWORD" -O "artifacts/${JAR3_ARTIFACT_ID}-${JAR3_VERSION}.jar" "$JAR3_URL"
+    
+    # Verify downloads
+    - ls -la artifacts/
+    - |
+      for jar in artifacts/*.jar; do
+        echo "Verifying $jar..."
+        file "$jar"
+        if [ ! -s "$jar" ]; then
+          echo "Error: $jar is empty or doesn't exist"
+          exit 1
+        fi
+      done
+  artifacts:
+    paths:
+      - artifacts/
+    expire_in: 1 hour
+  only:
+    - main
+    - master
+    - develop
+
+# Stage 2: Deploy JAR files to Application Server
+deploy_to_server:
+  stage: deploy
+  image: alpine:latest
+  dependencies:
+    - download_jars
+  before_script:
+    - apk add --no-cache openssh-client rsync
+    - eval $(ssh-agent -s)
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - ssh-keyscan -H $APP_SERVER_HOST >> ~/.ssh/known_hosts
+  script:
+    # Create backup of existing JARs
+    - |
+      echo "Creating backup of existing JARs..."
+      ssh $APP_SERVER_USER@$APP_SERVER_HOST "
+        sudo mkdir -p $APP_SERVER_PATH/backup/$(date +%Y%m%d_%H%M%S)
+        if [ -d '$APP_SERVER_PATH' ] && [ \$(ls -A $APP_SERVER_PATH/*.jar 2>/dev/null | wc -l) -gt 0 ]; then
+          sudo cp $APP_SERVER_PATH/*.jar $APP_SERVER_PATH/backup/\$(date +%Y%m%d_%H%M%S)/ 2>/dev/null || true
+        fi
+      "
+    
+    # Stop application service (optional - uncomment if needed)
+    # - ssh $APP_SERVER_USER@$APP_SERVER_HOST "sudo systemctl stop your-app-service"
+    
+    # Create deployment directory if it doesn't exist
+    - ssh $APP_SERVER_USER@$APP_SERVER_HOST "sudo mkdir -p $APP_SERVER_PATH"
+    
+    # Copy JAR files to application server
+    - |
+      echo "Deploying JAR files to $APP_SERVER_HOST:$APP_SERVER_PATH"
+      rsync -avz --progress artifacts/*.jar $APP_SERVER_USER@$APP_SERVER_HOST:/tmp/
+      
+      # Move files to final location with proper permissions
+      ssh $APP_SERVER_USER@$APP_SERVER_HOST "
+        sudo mv /tmp/${JAR1_ARTIFACT_ID}-${JAR1_VERSION}.jar $APP_SERVER_PATH/
+        sudo mv /tmp/${JAR2_ARTIFACT_ID}-${JAR2_VERSION}.jar $APP_SERVER_PATH/
+        sudo mv /tmp/${JAR3_ARTIFACT_ID}-${JAR3_VERSION}.jar $APP_SERVER_PATH/
+        sudo chown app:app $APP_SERVER_PATH/*.jar 2>/dev/null || true
+        sudo chmod 644 $APP_SERVER_PATH/*.jar
+      "
+    
+    # Start application service (optional - uncomment if needed)
+    # - ssh $APP_SERVER_USER@$APP_SERVER_HOST "sudo systemctl start your-app-service"
+    
+    - echo "Deployment completed successfully!"
+  only:
+    - main
+    - master
+    - develop
+  when: manual  # Remove this line for automatic deployment
+
+# Stage 3: Verify Deployment
+verify_deployment:
+  stage: verify
+  image: alpine:latest
+  dependencies: []
+  before_script:
+    - apk add --no-cache openssh-client
+    - eval $(ssh-agent -s)
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - ssh-keyscan -H $APP_SERVER_HOST >> ~/.ssh/known_hosts
+  script:
+    # Verify JAR files exist on the server
+    - |
+      echo "Verifying deployment..."
+      ssh $APP_SERVER_USER@$APP_SERVER_HOST "
+        echo 'Checking deployed JAR files:'
+        ls -la $APP_SERVER_PATH/*.jar
+        
+        echo 'Verifying JAR file integrity:'
+        for jar in $APP_SERVER_PATH/*.jar; do
+          if [ -f \"\$jar\" ]; then
+            echo \"✓ \$jar exists (size: \$(stat -c%s \"\$jar\") bytes)\"
+          else
+            echo \"✗ \$jar not found\"
+            exit 1
+          fi
+        done
+        
+        echo 'Deployment verification completed successfully!'
+      "
+  only:
+    - main
+    - master
+    - develop
+  when: on_success
+
+# Optional: Rollback job (manual trigger only)
+rollback:
+  stage: deploy
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache openssh-client
+    - eval $(ssh-agent -s)
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - ssh-keyscan -H $APP_SERVER_HOST >> ~/.ssh/known_hosts
+  script:
+    - |
+      echo "Rolling back to previous version..."
+      ssh $APP_SERVER_USER@$APP_SERVER_HOST "
+        LATEST_BACKUP=\$(ls -t $APP_SERVER_PATH/backup/ | head -n1)
+        if [ -n \"\$LATEST_BACKUP\" ] && [ -d \"$APP_SERVER_PATH/backup/\$LATEST_BACKUP\" ]; then
+          echo \"Rolling back to backup: \$LATEST_BACKUP\"
+          sudo cp $APP_SERVER_PATH/backup/\$LATEST_BACKUP/*.jar $APP_SERVER_PATH/
+          sudo chown app:app $APP_SERVER_PATH/*.jar 2>/dev/null || true
+          sudo chmod 644 $APP_SERVER_PATH/*.jar
+          echo \"Rollback completed successfully!\"
+        else
+          echo \"No backup found for rollback\"
+          exit 1
+        fi
+      "
+  only:
+    - main
+    - master
+    - develop
+  when: manual
